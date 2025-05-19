@@ -23,22 +23,21 @@ jobs:
           echo "MERGE_COMMIT_HASH=$MERGE_COMMIT_HASH" >> $GITHUB_ENV
           echo "Short hash: ${MERGE_COMMIT_HASH:0:8}"
 
-      - name: Get Linear issue IDs from PR title or description
+      - name: Get Linear issue IDs from branch name, PR title or description
         id: get-issue-ids
         run: |
           PR_TITLE="${{ github.event.pull_request.title }}"
           PR_BODY="${{ github.event.pull_request.body }}"
+          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
 
-          # Extract Linear issue IDs (format: ABC-123)
-          # Look in both title and body
-          ISSUES=$(echo "$PR_TITLE $PR_BODY" | grep -o -E '[A-Z]+-[0-9]+' | sort -u)
+          # Extract Linear issue IDs (e.g., ENG-255) from all sources
+          ISSUES=$(echo "$PR_TITLE $PR_BODY $BRANCH_NAME" | grep -o -E '[A-Z]+-[0-9]+' | sort -u)
 
           if [ -z "$ISSUES" ]; then
-            echo "No Linear issue IDs found in PR title or description"
+            echo "No Linear issue IDs found in PR title, body, or branch name"
             exit 1
           fi
 
-          # Format for subsequent steps
           ISSUES_JSON=$(echo "$ISSUES" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "ISSUE_IDS=$ISSUES_JSON" >> $GITHUB_ENV
           echo "Found issues: $ISSUES_JSON"
@@ -64,7 +63,6 @@ jobs:
 
             for (const issueId of issues) {
               try {
-                // First, get the current issue to check its state
                 const getResponse = await axios({
                   method: 'post',
                   url: 'https://api.linear.app/graphql',
@@ -92,19 +90,14 @@ jobs:
                 });
 
                 const issue = getResponse.data.data.issue;
-
                 if (!issue) {
                   console.log(`Issue ${issueId} not found`);
                   continue;
                 }
 
-                console.log(`Updating issue ${issue.identifier}`);
-
-                // Find the ID for "In Staging" state
-                // You'll need to replace this with your actual state ID from Linear
+                // Replace with actual state ID for "In Staging"
                 const stagingStateId = "YOUR_IN_STAGING_STATE_ID";
 
-                // Update the issue with the commit hash and change state
                 const updateResponse = await axios({
                   method: 'post',
                   url: 'https://api.linear.app/graphql',
@@ -114,14 +107,11 @@ jobs:
                   },
                   data: JSON.stringify({
                     query: `
-                      mutation UpdateIssue($id: String!, $commitHash: String!, $stateId: String!, $comment: String!) {
+                      mutation UpdateIssue($id: String!, $stateId: String!, $comment: String!) {
                         issueUpdate(
                           id: $id,
                           input: {
-                            stateId: $stateId,
-                            customFields: {
-                              commitHash: $commitHash
-                            }
+                            stateId: $stateId
                           }
                         ) {
                           success
@@ -138,7 +128,6 @@ jobs:
                     `,
                     variables: {
                       id: issue.id,
-                      commitHash: commitHash,
                       stateId: stagingStateId,
                       comment: `Merged to staging via PR #${prNumber}.\nCommit: \`${commitHash}\`\nPR: ${prUrl}\n\nReady for QA verification.`
                     }
