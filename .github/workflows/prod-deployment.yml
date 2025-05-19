@@ -1,0 +1,44 @@
+name: Production Deployment
+on:
+  push:
+    branches: [release/*]
+jobs:
+  verify-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Tests
+        run: ./run-tests.sh
+
+      - name: Deploy to Production
+        if: success()
+        run: ./deploy-to-prod.sh
+        env:
+          PRODUCTION_KEY: ${{ secrets.PRODUCTION_KEY }}
+
+      - name: Mark as Released in Linear
+        if: success()
+        uses: actions/github-script@v6
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        with:
+          script: |
+            const releaseId = context.ref.split('/').pop();
+            // Fetch all Linear issues with this Release ID and update status
+            await fetch('https://api.linear.app/graphql', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${process.env.LINEAR_API_KEY}`,
+              },
+              body: JSON.stringify({
+                query: `
+                  mutation ReleaseIssues($releaseId: String!) {
+                    issues(filter: { customFields: { releaseId: { eq: $releaseId } } }) {
+                      nodes { id }
+                    }
+                    issueUpdate(input: { state: "Released" }) { success }
+                  }
+                `,
+                variables: { releaseId },
+              }),
+            });
