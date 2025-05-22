@@ -173,3 +173,5 @@ jobs:
             Check release notes and deployment status.
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+          #Test
