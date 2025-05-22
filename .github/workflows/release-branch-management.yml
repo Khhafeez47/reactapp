@@ -1,7 +1,6 @@
 name: Create Release Branch
 
 on:
-  # Manual trigger with release version input
   workflow_dispatch:
     inputs:
       release_version:
@@ -14,347 +13,204 @@ on:
         description: 'Linear IDs to exclude from release (comma-separated)'
         required: false
         default: ''
+  repository_dispatch:
+    types: [slack_release_approval]
 
 jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
 
-      - name: Set up Git
+      - name: Set up Git user
         run: |
           git config user.name "Release Bot"
           git config user.email "release-bot@example.com"
 
-      - name: Query Linear for QA-approved issues
+      - name: Query Linear for QA-approved release candidate issues
         id: linear-query
         uses: actions/github-script@v6
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          SKIP_FEATURES: ${{ github.event.inputs.skip_features }}
+          SKIP_FEATURES: ${{ github.event.inputs.skip_features || github.event.client_payload.skip_features || '' }}
         with:
           script: |
             const axios = require('axios');
+            const skipFeatures = process.env.SKIP_FEATURES ? process.env.SKIP_FEATURES.split(',').map(s => s.trim()) : [];
 
-            // Parse skip features to array
-            const skipFeatures = process.env.SKIP_FEATURES ?
-              process.env.SKIP_FEATURES.split(',').map(id => id.trim()) : [];
-
-            console.log(`Will skip features: ${skipFeatures.join(', ') || 'none'}`);
-
-            // Query for QA-approved issues that have commit hashes
-            const response = await axios({
-              method: 'post',
-              url: 'https://api.linear.app/graphql',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': process.env.LINEAR_API_KEY
-              },
-              data: JSON.stringify({
-                query: `
-                  query GetApprovedIssues {
-                    issues(
-                      filter: {
-                        state: { name: { eq: "QA Approved" } },
-                        customFields: [
-                          { name: { eq: "commitHash" }, isEmpty: false },
-                          { name: { eq: "Release ID" }, isEmpty: true }
-                        ]
+            const response = await axios.post('https://api.linear.app/graphql', {
+              query: `
+                query {
+                  issues(
+                    filter: {
+                      state: { name: { eq: "QA Approved" } }
+                    }
+                  ) {
+                    nodes {
+                      id
+                      identifier
+                      title
+                      description
+                      customFields {
+                        name
+                        value
                       }
-                    ) {
-                      nodes {
-                        id
-                        identifier
-                        title
-                        customFields {
-                          name
-                          value
+                      relations {
+                        nodes {
+                          type
+                          relatedIssue {
+                            identifier
+                            state { name }
+                          }
+                        }
+                      }
+                      creator { name }
+                      comments {
+                        nodes {
+                          body
                         }
                       }
                     }
                   }
-                `
-              })
+                }
+              `
+            }, {
+              headers: {
+                Authorization: process.env.LINEAR_API_KEY,
+                'Content-Type': 'application/json'
+              }
             });
 
-            // Extract commit hashes from issues
-            const approvedIssues = response.data.data.issues.nodes
-              .filter(issue => !skipFeatures.includes(issue.identifier));
+            const allIssues = response.data.data.issues.nodes;
 
-            // Map issues to get their commit hashes
-            const issuesWithHashes = approvedIssues.map(issue => {
-              const commitHashField = issue.customFields.find(cf => cf.name === "commitHash");
-              return {
+            // Filter out skipped features
+            const filteredBySkip = allIssues.filter(issue => !skipFeatures.includes(issue.identifier));
+
+            // Filter out not ready for release
+            const readyIssues = filteredBySkip.filter(issue => {
+              const readyField = issue.customFields.find(cf => cf.name === 'Ready For Release');
+              return !readyField || readyField.value !== 'false';
+            });
+
+            // Filter dependencies - all dependencies must be QA Approved
+            const validIssues = readyIssues.filter(issue => {
+              const dependenciesField = issue.customFields.find(cf => cf.name === 'Dependencies');
+              if (!dependenciesField || !dependenciesField.value) return true;
+              const deps = issue.relations.nodes.filter(r => r.type === 'depends on');
+              return deps.every(dep => dep.relatedIssue.state.name === 'QA Approved');
+            });
+
+            // Extract commit hash from comments
+            const issuesWithCommit = validIssues.map(issue => {
+              let commitHash = null;
+              for (const comment of issue.comments.nodes) {
+                const match = comment.body.match(/Commit:\s*`([a-f0-9]+)`/i);
+                if (match) {
+                  commitHash = match[1];
+                  break;
+                }
+              }
+              return { 
                 id: issue.id,
                 identifier: issue.identifier,
                 title: issue.title,
-                commitHash: commitHashField ? commitHashField.value : null
+                commitHash,
+                creator: issue.creator?.name || 'Unknown'
               };
             }).filter(issue => issue.commitHash);
 
-            if (issuesWithHashes.length === 0) {
-              core.setFailed('No QA-approved issues with commit hashes found');
+            if (issuesWithCommit.length === 0) {
+              core.setFailed('No release-ready issues with commit hashes found');
               return;
             }
 
-            console.log(`Found ${issuesWithHashes.length} approved issues with commit hashes`);
+            core.setOutput('issues', JSON.stringify(issuesWithCommit));
+            core.exportVariable('APPROVED_ISSUES', JSON.stringify(issuesWithCommit));
+            core.exportVariable('ISSUES_FOR_DISPLAY', JSON.stringify(
+              issuesWithCommit.map(i => ({ identifier: i.identifier, title: i.title, creator: i.creator }))
+            ));
 
-            // Save to outputs
-            core.setOutput('issues', JSON.stringify(issuesWithHashes));
-            // Add to env for next steps
-            console.log(`ISSUES=${JSON.stringify(issuesWithHashes)}`);
-            core.exportVariable('APPROVED_ISSUES', JSON.stringify(issuesWithHashes));
-
-      - name: Create release branch
-        id: create-branch
+      - name: Prepare release info
+        id: prepare-release
         env:
-          RELEASE_VERSION: ${{ github.event.inputs.release_version }}
+          RELEASE_VERSION: ${{ github.event.inputs.release_version || github.event.client_payload.release_version }}
+          RELEASE_NAME: ${{ github.event.inputs.release_name || github.event.client_payload.release_name }}
+        run: |
+          echo "RELEASE_VERSION=${RELEASE_VERSION}" >> $GITHUB_ENV
+          echo "RELEASE_NAME=${RELEASE_NAME}" >> $GITHUB_ENV
+
+      - name: Create release branch and cherry-pick commits
+        env:
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
           APPROVED_ISSUES: ${{ env.APPROVED_ISSUES }}
         run: |
-          # Start from main branch
           git checkout main
+          BRANCH="release/${RELEASE_VERSION}"
+          git checkout -b $BRANCH
+          echo "BRANCH_NAME=$BRANCH" >> $GITHUB_ENV
 
-          # Create the release branch
-          BRANCH_NAME="release/${RELEASE_VERSION}"
-          git checkout -b $BRANCH_NAME
+          TEMP=$(mktemp)
+          echo "# Release ${RELEASE_VERSION}" > $TEMP
+          echo "" >> $TEMP
+          echo "## Included Changes" >> $TEMP
+          echo "" >> $TEMP
 
-          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
-
-          # Create a temporary file for the release notes
-          RELEASE_NOTES=$(mktemp)
-          echo "# Release ${RELEASE_VERSION}" > $RELEASE_NOTES
-          echo "" >> $RELEASE_NOTES
-          echo "## Included Changes" >> $RELEASE_NOTES
-          echo "" >> $RELEASE_NOTES
-
-          # Cherry-pick each approved commit
-          ISSUES=$(echo $APPROVED_ISSUES | jq -c '.[]')
           SUCCESS=true
-          APPLIED_ISSUES=()
-          FAILED_ISSUES=()
+          APPLIED=()
+          FAILED=()
 
-          echo "$ISSUES" | while read -r issue; do
-            ID=$(echo $issue | jq -r '.identifier')
-            HASH=$(echo $issue | jq -r '.commitHash')
-            TITLE=$(echo $issue | jq -r '.title')
-
-            echo "Processing $ID: $TITLE ($HASH)"
-
-            # Try to cherry-pick the commit
-            if git cherry-pick $HASH; then
-              echo "- $ID: $TITLE" >> $RELEASE_NOTES
-              APPLIED_ISSUES+=("$ID")
-              echo "Successfully applied $ID"
+          echo "$APPROVED_ISSUES" | jq -c '.[]' | while read -r issue; do
+            ID=$(echo "$issue" | jq -r '.identifier')
+            HASH=$(echo "$issue" | jq -r '.commitHash')
+            TITLE=$(echo "$issue" | jq -r '.title')
+            echo "Applying $ID - $TITLE ($HASH)"
+            if git cherry-pick "$HASH"; then
+              echo "- $ID: $TITLE" >> $TEMP
+              APPLIED+=("$ID")
+              echo "Applied $ID"
             else
-              echo "Failed to apply $ID due to conflicts"
-              FAILED_ISSUES+=("$ID")
-              # Abort the cherry-pick to try the next one
+              echo "Failed $ID"
+              FAILED+=("$ID")
               git cherry-pick --abort
               SUCCESS=false
             fi
           done
 
-          # Add special note for conflicts
           if [ "$SUCCESS" = false ]; then
-            echo "" >> $RELEASE_NOTES
-            echo "## Conflicts Detected" >> $RELEASE_NOTES
-            echo "" >> $RELEASE_NOTES
-            echo "The following issues could not be automatically included due to conflicts:" >> $RELEASE_NOTES
-            for ID in "${FAILED_ISSUES[@]}"; do
-              echo "- $ID" >> $RELEASE_NOTES
+            echo "" >> $TEMP
+            echo "## Conflicts detected" >> $TEMP
+            for f in "${FAILED[@]}"; do
+              echo "- $f" >> $TEMP
             done
-            echo "" >> $RELEASE_NOTES
-            echo "**Manual resolution required before release can proceed.**" >> $RELEASE_NOTES
+            echo "**Manual resolution required before release can proceed.**" >> $TEMP
           fi
 
-          # Commit the release notes
-          cp $RELEASE_NOTES RELEASE_NOTES.md
+          cp $TEMP RELEASE_NOTES.md
           git add RELEASE_NOTES.md
           git commit -m "Add release notes for ${RELEASE_VERSION}"
 
-          # Push the branch
-          git push origin $BRANCH_NAME
+          git push origin $BRANCH
 
-          # Set success status
           if [ "$SUCCESS" = false ]; then
             echo "CONFLICTS_DETECTED=true" >> $GITHUB_ENV
-            echo "::warning::Some commits could not be applied due to conflicts"
           else
             echo "CONFLICTS_DETECTED=false" >> $GITHUB_ENV
           fi
 
-          echo "RELEASE_NOTES=$(cat $RELEASE_NOTES)" >> $GITHUB_ENV
+          RELEASE_NOTES_CONTENT=$(cat $TEMP)
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
+          echo "$RELEASE_NOTES_CONTENT" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
-      - name: Update Linear with release info
-        if: env.CONFLICTS_DETECTED == 'false'
-        uses: actions/github-script@v6
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          APPROVED_ISSUES: ${{ env.APPROVED_ISSUES }}
-          RELEASE_VERSION: ${{ github.event.inputs.release_version }}
-          RELEASE_NAME: ${{ github.event.inputs.release_name }}
-          BRANCH_NAME: ${{ env.BRANCH_NAME }}
-        with:
-          script: |
-            const axios = require('axios');
-
-            // Create a release in Linear
-            console.log("Creating release in Linear");
-            const createReleaseResponse = await axios({
-              method: 'post',
-              url: 'https://api.linear.app/graphql',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': process.env.LINEAR_API_KEY
-              },
-              data: JSON.stringify({
-                query: `
-                  mutation CreateRelease($input: ReleaseCreateInput!) {
-                    releaseCreate(input: $input) {
-                      success
-                      release {
-                        id
-                      }
-                    }
-                  }
-                `,
-                variables: {
-                  input: {
-                    name: process.env.RELEASE_NAME,
-                    version: process.env.RELEASE_VERSION,
-                    description: `Release branch: ${process.env.BRANCH_NAME}`,
-                    branchName: process.env.BRANCH_NAME
-                  }
-                }
-              })
-            });
-
-            if (!createReleaseResponse.data.data.releaseCreate.success) {
-              core.setFailed("Failed to create release in Linear");
-              return;
-            }
-
-            const releaseId = createReleaseResponse.data.data.releaseCreate.release.id;
-            console.log(`Created Linear release with ID: ${releaseId}`);
-
-            // Update all issues to associate them with this release
-            const issues = JSON.parse(process.env.APPROVED_ISSUES);
-
-            for (const issue of issues) {
-              console.log(`Updating issue ${issue.identifier} with release ID`);
-
-              try {
-                await axios({
-                  method: 'post',
-                  url: 'https://api.linear.app/graphql',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': process.env.LINEAR_API_KEY
-                  },
-                  data: JSON.stringify({
-                    query: `
-                      mutation UpdateIssue($id: String!, $releaseId: String!) {
-                        issueUpdate(
-                          id: $id,
-                          input: {
-                            customFields: {
-                              releaseId: $releaseId
-                            }
-                          }
-                        ) {
-                          success
-                        }
-                      }
-                    `,
-                    variables: {
-                      id: issue.id,
-                      releaseId: releaseId
-                    }
-                  })
-                });
-              } catch (error) {
-                console.error(`Error updating issue ${issue.identifier}:`, error.message);
-                // Continue with other issues even if one fails
-              }
-            }
-
-      - name: Create Pull Request
-        if: env.CONFLICTS_DETECTED == 'false'
-        uses: actions/github-script@v6
-        env:
-          RELEASE_VERSION: ${{ github.event.inputs.release_version }}
-          RELEASE_NAME: ${{ github.event.inputs.release_name }}
-          BRANCH_NAME: ${{ env.BRANCH_NAME }}
-          RELEASE_NOTES: ${{ env.RELEASE_NOTES }}
-        with:
-          script: |
-            const { repo, owner } = context.repo;
-
-            const response = await github.rest.pulls.create({
-              owner,
-              repo,
-              title: `Release ${process.env.RELEASE_VERSION}: ${process.env.RELEASE_NAME}`,
-              body: process.env.RELEASE_NOTES,
-              head: process.env.BRANCH_NAME,
-              base: 'main',
-              draft: false
-            });
-
-            console.log(`Created PR #${response.data.number}`);
-
-            // Add appropriate labels
-            await github.rest.issues.addLabels({
-              owner,
-              repo,
-              issue_number: response.data.number,
-              labels: ['release', 'needs-verification']
-            });
-
-      - name: Notify about conflicts
-        if: env.CONFLICTS_DETECTED == 'true'
-        uses: actions/github-script@v6
-        env:
-          RELEASE_VERSION: ${{ github.event.inputs.release_version }}
-          BRANCH_NAME: ${{ env.BRANCH_NAME }}
-        with:
-          script: |
-            const { repo, owner } = context.repo;
-
-            // Create an issue to track the conflict resolution
-            const response = await github.rest.issues.create({
-              owner,
-              repo,
-              title: `Release ${process.env.RELEASE_VERSION} has conflicts that need resolution`,
-              body: `
-              # Conflicts in Release ${process.env.RELEASE_VERSION}
-
-              The automated release branch creation process encountered conflicts that need manual resolution.
-
-              ## Next steps:
-
-              1. Check out the branch: \`git checkout ${process.env.BRANCH_NAME}\`
-              2. Resolve the conflicts noted in RELEASE_NOTES.md
-              3. Complete the release manually once conflicts are resolved
-
-              CC: @release-team
-              `,
-              labels: ['release-conflict', 'high-priority']
-            });
-
-            console.log(`Created issue #${response.data.number} to track conflict resolution`);
-
-      - name: Post to Slack
+      - name: Send Slack approval message
         uses: slackapi/slack-github-action@v1.23.0
         with:
           channel-id: 'releases'
           slack-message: |
-            *New Release Branch Created*
-            Version: ${{ github.event.inputs.release_version }}
-            Name: ${{ github.event.inputs.release_name }}
-            Branch: ${{ env.BRANCH_NAME }}
-            ${{ env.CONFLICTS_DETECTED == 'true' && '⚠️ CONFLICTS DETECTED - Manual resolution required!' || '✅ Ready for final verification' }}
+            *Release ${RELEASE_VERSION}* created with ${APPROVED_ISSUES.length} issues.
+            Please review and approve via Slack.
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

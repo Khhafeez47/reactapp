@@ -21,127 +21,90 @@ jobs:
         run: |
           MERGE_COMMIT_HASH=${{ github.event.pull_request.merge_commit_sha }}
           echo "MERGE_COMMIT_HASH=$MERGE_COMMIT_HASH" >> $GITHUB_ENV
-          echo "Short hash: ${MERGE_COMMIT_HASH:0:8}"
 
-      - name: Get Linear issue IDs from branch name, PR title or description
-        id: get-issue-ids
+      - name: Extract Linear issue IDs from PR title and body
+        id: get-issues
         run: |
           PR_TITLE="${{ github.event.pull_request.title }}"
           PR_BODY="${{ github.event.pull_request.body }}"
-          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
 
-          # Extract Linear issue IDs (e.g., ENG-255) from all sources
-          ISSUES=$(echo "$PR_TITLE $PR_BODY $BRANCH_NAME" | grep -o -E '[A-Z]+-[0-9]+' | sort -u)
+          ISSUES=$(echo "$PR_TITLE $PR_BODY" | grep -o -E '[A-Z]+-[0-9]+' | sort -u)
 
           if [ -z "$ISSUES" ]; then
-            echo "No Linear issue IDs found in PR title, body, or branch name"
+            echo "No Linear issue IDs found"
             exit 1
           fi
 
           ISSUES_JSON=$(echo "$ISSUES" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "ISSUE_IDS=$ISSUES_JSON" >> $GITHUB_ENV
-          echo "Found issues: $ISSUES_JSON"
+          echo "ISSUES=$ISSUES_JSON" >> $GITHUB_ENV
 
-      - name: Update Linear issues with commit hash
+      - name: Update Linear issues with commit hash and set state
         uses: actions/github-script@v6
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUES: ${{ env.ISSUE_IDS }}
+          ISSUES: ${{ env.ISSUES }}
           COMMIT_HASH: ${{ env.MERGE_COMMIT_HASH }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_URL: ${{ github.event.pull_request.html_url }}
+          STAGING_STATE_ID: ${{ secrets.LINEAR_STAGING_STATE_ID }}
         with:
           script: |
             const axios = require('axios');
-
             const issues = JSON.parse(process.env.ISSUES);
             const commitHash = process.env.COMMIT_HASH;
             const prNumber = process.env.PR_NUMBER;
             const prUrl = process.env.PR_URL;
+            const stagingStateId = process.env.STAGING_STATE_ID;
 
-            console.log(`Updating Linear issues: ${issues.join(', ')}`);
-
-            for (const issueId of issues) {
+            for (const identifier of issues) {
               try {
-                const getResponse = await axios({
-                  method: 'post',
-                  url: 'https://api.linear.app/graphql',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': process.env.LINEAR_API_KEY
-                  },
-                  data: JSON.stringify({
-                    query: `
-                      query GetIssue($id: String!) {
-                        issue(id: $id) {
-                          id
-                          identifier
-                          state {
-                            id
-                            name
-                          }
-                        }
-                      }
-                    `,
-                    variables: {
-                      id: issueId
+                const query = `
+                  query GetIssue($identifier: String!) {
+                    issues(filter: { identifier: { eq: $identifier } }) {
+                      nodes { id }
                     }
-                  })
-                });
+                  }
+                `;
+                const res = await axios.post('https://api.linear.app/graphql', {
+                  query,
+                  variables: { identifier }
+                }, { headers: { Authorization: process.env.LINEAR_API_KEY, 'Content-Type': 'application/json' } });
 
-                const issue = getResponse.data.data.issue;
-                if (!issue) {
-                  console.log(`Issue ${issueId} not found`);
+                const nodes = res.data.data.issues.nodes;
+                if (!nodes.length) {
+                  console.log(\`Issue \${identifier} not found\`);
                   continue;
                 }
+                const issueId = nodes[0].id;
 
-                // Replace with actual state ID for "In Staging"
-                const stagingStateId = "YOUR_IN_STAGING_STATE_ID";
-
-                const updateResponse = await axios({
-                  method: 'post',
-                  url: 'https://api.linear.app/graphql',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': process.env.LINEAR_API_KEY
-                  },
-                  data: JSON.stringify({
-                    query: `
-                      mutation UpdateIssue($id: String!, $stateId: String!, $comment: String!) {
-                        issueUpdate(
-                          id: $id,
-                          input: {
-                            stateId: $stateId
-                          }
-                        ) {
-                          success
-                        }
-                        commentCreate(
-                          input: {
-                            issueId: $id,
-                            body: $comment
-                          }
-                        ) {
-                          success
-                        }
+                // Update issue state
+                await axios.post('https://api.linear.app/graphql', {
+                  query: `
+                    mutation UpdateIssue($id: String!, $stateId: String!) {
+                      issueUpdate(id: $id, input: { stateId: $stateId }) {
+                        success
                       }
-                    `,
-                    variables: {
-                      id: issue.id,
-                      stateId: stagingStateId,
-                      comment: `Merged to staging via PR #${prNumber}.\nCommit: \`${commitHash}\`\nPR: ${prUrl}\n\nReady for QA verification.`
                     }
-                  })
-                });
+                  `,
+                  variables: { id: issueId, stateId: stagingStateId }
+                }, { headers: { Authorization: process.env.LINEAR_API_KEY, 'Content-Type': 'application/json' } });
 
-                if (updateResponse.data.data.issueUpdate.success) {
-                  console.log(`Successfully updated issue ${issue.identifier}`);
-                } else {
-                  console.error(`Failed to update issue ${issue.identifier}`);
-                }
+                // Add comment with commit hash & PR link
+                const commentBody = \`Merged to staging via PR #\${prNumber}.\nCommit: \\\`\${commitHash}\\\`\nPR Link: \${prUrl}\nReady for QA verification.\`;
 
+                await axios.post('https://api.linear.app/graphql', {
+                  query: `
+                    mutation CreateComment($issueId: String!, $body: String!) {
+                      commentCreate(input: { issueId: $issueId, body: $body }) {
+                        success
+                      }
+                    }
+                  `,
+                  variables: { issueId, body: commentBody }
+                }, { headers: { Authorization: process.env.LINEAR_API_KEY, 'Content-Type': 'application/json' } });
+
+                console.log(\`Updated issue \${identifier}\`);
               } catch (error) {
-                console.error(`Error updating issue ${issueId}:`, error.message);
-                core.setFailed(`Error updating Linear: ${error.message}`);
+                console.error(\`Failed updating issue \${identifier}: \`, error.message);
               }
             }
