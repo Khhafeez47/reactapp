@@ -62,3 +62,5 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{"query":"mutation { issueUpdate(id: \"'$TICKET_NUMBER'\", input: {stateId: \"2dfd5d6f-b44b-435d-b75f-dce42bcd8af9\"}) { success issue { id title } } }"}')
           echo "Linear API response: $response"
+
+#Test
