@@ -1,0 +1,64 @@
+name: Update Linear Ticket Status
+
+on:
+  pull_request:
+    types: [opened, synchronize, closed]
+  push:
+    branches:
+      - '*/ENG-*'   # Matches any branch containing 'ENG-' for the ticket number
+
+jobs:
+  update-linear:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Debug ticket number extraction
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            ticket_number=$(echo "${{ github.head_ref }}" | grep -o 'ENG-[0-9]*')
+          else
+            ticket_number=$(echo ${GITHUB_REF} | grep -o 'ENG-[0-9]*')
+          fi
+          echo "Ticket number extracted: ${ticket_number}"
+          echo "TICKET_NUMBER=${ticket_number}" >> $GITHUB_ENV
+
+      - name: Update Linear ticket to "In Progress"
+        if: github.event.pull_request.state == 'open' || github.event.pull_request.state == 'synchronize'
+        run: |
+          echo "Updating Linear ticket: $TICKET_NUMBER to In Progress"
+          response=$(curl -X POST https://api.linear.app/graphql \
+            -H "Authorization: Bearer ${{ secrets.LINEAR_DEVELOPER_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"query":"mutation { issueUpdate(id: \"'$TICKET_NUMBER'\", input: {stateId: \"2dfd5d6f-b44b-435d-b75f-dce42bcd8af9\"}) { success issue { id title } } }"}')
+          echo "Linear API response: $response"
+
+      - name: Update Linear ticket to "Ready for QA" and assign to Support Team
+        if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'stage'
+        run: |
+          echo "Updating Linear ticket: $TICKET_NUMBER to Ready for QA and assigning to Support Team"
+          response=$(curl -X POST https://api.linear.app/graphql \
+            -H "Authorization: Bearer ${{ secrets.LINEAR_DEVELOPER_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"query":"mutation { issueUpdate(id: \"'$TICKET_NUMBER'\", input: {stateId: \"b93954d1-62cd-4976-89fa-47a3430459dd\"}) { success issue { id title } } }"}'
+          echo "Linear API response: $response"
+
+      - name: Update Linear ticket when a new branch is pushed
+        if: github.event_name == 'push'
+        run: |
+          echo "Updating Linear ticket: $TICKET_NUMBER to In Progress due to branch push"
+          response=$(curl -X POST https://api.linear.app/graphql \
+            -H "Authorization: Bearer ${{ secrets.LINEAR_DEVELOPER_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"query":"mutation { issueUpdate(id: \"'$TICKET_NUMBER'\", input: {stateId: \"2dfd5d6f-b44b-435d-b75f-dce42bcd8af9\"}) { success issue { id title } } }"}')
+          echo "Linear API response: $response"
